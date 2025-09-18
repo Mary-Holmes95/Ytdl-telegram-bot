@@ -1,7 +1,6 @@
 import os
 import re
 import logging
-import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 import yt_dlp
@@ -14,22 +13,19 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-# Whitelist stored in memory
+# Whitelist
 whitelist = {ADMIN_ID}
 
-# Regex to detect YouTube links (fixed, supports youtu.be and shorts)
-YOUTUBE_REGEX = re.compile(
-    r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/(watch\?v=|shorts/)?[A-Za-z0-9_\-]{11}"
-)
+# Regex for YouTube links
+YOUTUBE_REGEX = re.compile(r"(https?://[^\s]+)")
 
 # --- Commands ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in whitelist:
+    if update.effective_user.id not in whitelist:
         await update.message.reply_text("❌ You are not allowed to use this bot.")
         return
-    await update.message.reply_text("✅ Send me one or more YouTube links and I’ll download them!")
+    await update.message.reply_text("✅ Send me YouTube links (one or many) and I’ll download them!")
 
 async def adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -58,20 +54,15 @@ async def deluser(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error: {e}")
 
 async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in whitelist:
+    if update.effective_user.id not in whitelist:
         await update.message.reply_text("❌ You are not allowed to use this bot.")
         return
 
     text = update.message.text.strip()
-    links = YOUTUBE_REGEX.findall(text)
-
-    # Extract proper links
-    matches = re.findall(r"(https?://[^\s]+)", text)
-    links = [url for url in matches if "youtu" in url]
+    links = [url for url in re.findall(YOUTUBE_REGEX, text) if "youtu" in url]
 
     if not links:
-        await update.message.reply_text("❌ No YouTube links found!\nSend me YouTube links like:\nhttps://youtube.com/watch?v=...")
+        await update.message.reply_text("❌ No YouTube links found!")
         return
 
     await update.message.reply_text(f"📥 Downloading {len(links)} videos...")
@@ -90,7 +81,6 @@ async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 info = ydl.extract_info(url, download=True)
                 filename = ydl.prepare_filename(info)
 
-            # Telegram max size 50 MB free, 2 GB premium
             if os.path.getsize(filename) > 49 * 1024 * 1024:
                 await update.message.reply_text(f"⚠️ Skipped {url} (file too large for free Telegram).")
                 failed.append(url)
@@ -112,7 +102,6 @@ async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ All videos sent!")
 
 # --- Main ---
-
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -123,25 +112,4 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
-    main()
-
-# --- Keep-alive server ---
-from flask import Flask
-import threading
-
-def run_web():
-    app = Flask("keep_alive")
-
-    @app.route("/")
-    def home():
-        return "Bot is alive!"
-
-    app.run(host="0.0.0.0", port=8080)
-
-def keep_alive():
-    t = threading.Thread(target=run_web)
-    t.start()
-
-if __name__ == "__main__":
-    keep_alive()
     main()
