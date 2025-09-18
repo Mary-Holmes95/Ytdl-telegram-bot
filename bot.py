@@ -1,115 +1,76 @@
 import os
-import re
-import logging
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-import yt_dlp
+import time
+import telebot
+from flask import Flask
 
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# =====================
+# BOT CONFIG
+# =====================
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")  # Add in Replit Secrets
+bot = telebot.TeleBot(BOT_TOKEN)
 
-# Environment variables
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+# =====================
+# BATCH SENDING SETTINGS
+# =====================
+BATCH_SIZE = 10   # Change if you want smaller/larger batches
+DELAY_BETWEEN_BATCHES = 2  # seconds delay between batches
 
-# Whitelist
-whitelist = {ADMIN_ID}
 
-# Regex for YouTube links
-YOUTUBE_REGEX = re.compile(r"(https?://[^\s]+)")
+# =====================
+# COMMAND HANDLERS
+# =====================
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    bot.reply_to(message, "✅ Bot is online and ready!")
 
-# --- Commands ---
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in whitelist:
-        await update.message.reply_text("❌ You are not allowed to use this bot.")
-        return
-    await update.message.reply_text("✅ Send me YouTube links (one or many) and I’ll download them!")
+@bot.message_handler(commands=['send'])
+def send_batch(message):
+    """
+    Sends a batch of dummy video links (replace with your real video list).
+    """
+    chat_id = message.chat.id
 
-async def adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /adduser <user_id>")
-        return
-    try:
-        uid = int(context.args[0])
-        whitelist.add(uid)
-        await update.message.reply_text(f"✅ Added user {uid} to whitelist.")
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
+    # Example video links (replace with your own)
+    video_links = [
+        f"https://example.com/video{i}.mp4" for i in range(1, 51)
+    ]
 
-async def deluser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /deluser <user_id>")
-        return
-    try:
-        uid = int(context.args[0])
-        whitelist.discard(uid)
-        await update.message.reply_text(f"✅ Removed user {uid} from whitelist.")
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
+    # Send in batches
+    for i in range(0, len(video_links), BATCH_SIZE):
+        batch = video_links[i:i+BATCH_SIZE]
+        for link in batch:
+            try:
+                bot.send_message(chat_id, link)
+            except Exception as e:
+                print(f"Error sending message: {e}")
+                time.sleep(2)
 
-async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in whitelist:
-        await update.message.reply_text("❌ You are not allowed to use this bot.")
-        return
+        time.sleep(DELAY_BETWEEN_BATCHES)
 
-    text = update.message.text.strip()
-    links = [url for url in re.findall(YOUTUBE_REGEX, text) if "youtu" in url]
 
-    if not links:
-        await update.message.reply_text("❌ No YouTube links found!")
-        return
+# =====================
+# KEEP-ALIVE FLASK SERVER
+# =====================
+app = Flask(__name__)
 
-    await update.message.reply_text(f"📥 Downloading {len(links)} videos...")
+@app.route('/')
+def home():
+    return "Bot is running!"
 
-    failed = []
-    for idx, url in enumerate(links, start=1):
-        try:
-            await update.message.reply_text(f"▶️ Processing video {idx}/{len(links)}...")
 
-            ydl_opts = {
-                "format": "best[height<=480]",  # default 480p
-                "outtmpl": f"downloads/%(title)s.%(ext)s",
-                "quiet": True,
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
+def run_flask():
+    app.run(host="0.0.0.0", port=8080)
 
-            if os.path.getsize(filename) > 49 * 1024 * 1024:
-                await update.message.reply_text(f"⚠️ Skipped {url} (file too large for free Telegram).")
-                failed.append(url)
-                os.remove(filename)
-                continue
 
-            with open(filename, "rb") as f:
-                await update.message.reply_video(video=f, caption=info.get("title", "Video"))
-
-            os.remove(filename)
-
-        except Exception as e:
-            logger.error(f"Error downloading {url}: {e}")
-            failed.append(url)
-
-    if failed:
-        await update.message.reply_text("❌ Failed links:\n" + "\n".join(failed))
-    else:
-        await update.message.reply_text("✅ All videos sent!")
-
-# --- Main ---
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("adduser", adduser))
-    app.add_handler(CommandHandler("deluser", deluser))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_links))
-    logger.info("Bot started")
-    app.run_polling()
+# =====================
+# START BOT + KEEP ALIVE
+# =====================
+import threading
 
 if __name__ == "__main__":
-    main()
+    # Run Flask server in a separate thread
+    threading.Thread(target=run_flask).start()
+
+    # Start polling the Telegram bot
+    bot.infinity_polling(skip_pending=True)
