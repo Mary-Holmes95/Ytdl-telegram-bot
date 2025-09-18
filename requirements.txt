@@ -1,2 +1,2 @@
-python-telegram-bot==20.3
-yt-dlp
+pyTelegramBotAPI==4.14.0
+Flask==3.0.3
