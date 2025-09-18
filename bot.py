@@ -108,11 +108,16 @@ class YouTubeBot:
         try:
             format_selector = self.quality_options.get(quality, 'best')
             
+            # Create unique filename to avoid conflicts
+            import time
+            timestamp = int(time.time())
+            
             ydl_opts = {
                 'format': format_selector,
-                'outtmpl': os.path.join(output_path, '%(title)s.%(ext)s'),
+                'outtmpl': os.path.join(output_path, f'%(title)s_{timestamp}.%(ext)s'),
                 'quiet': True,
                 'no_warnings': True,
+                'restrictfilenames': True,  # Avoid special characters
             }
             
             # Add audio format for audio-only downloads
@@ -129,19 +134,17 @@ class YouTubeBot:
                     None, lambda: ydl.extract_info(url, download=True)
                 )
                 
-                # Find the downloaded file
-                title = info.get('title', 'video')
-                ext = 'mp3' if quality == 'audio' else info.get('ext', 'mp4')
-                filename = f"{title}.{ext}"
-                filepath = os.path.join(output_path, filename)
-                
-                # Find actual file (yt-dlp might change filename)
+                # Find the downloaded file more reliably
+                downloaded_files = []
                 for file in os.listdir(output_path):
-                    if file.startswith(title.replace('/', '_').replace('\\', '_')[:50]):
-                        filepath = os.path.join(output_path, file)
-                        break
+                    if file.endswith(('.mp4', '.webm', '.mkv', '.mp3', '.m4a')):
+                        downloaded_files.append(os.path.join(output_path, file))
                 
-                return filepath if os.path.exists(filepath) else None
+                if downloaded_files:
+                    # Return the most recently created file
+                    return max(downloaded_files, key=os.path.getctime)
+                
+                return None
                 
         except Exception as e:
             logger.error(f"Error downloading {url}: {e}")
@@ -356,29 +359,45 @@ class YouTubeBot:
                 )
                 
                 # Send file
-                with open(filepath, 'rb') as video_file:
+                try:
                     if quality == 'audio':
-                        await update.message.reply_audio(
-                            audio=video_file,
-                            title=title,
-                            caption=f"🎵 **{title}**\n📊 Quality: {quality}\n🔗 Source: {url}",
-                            parse_mode=ParseMode.MARKDOWN
-                        )
+                        with open(filepath, 'rb') as audio_file:
+                            await update.message.reply_audio(
+                                audio=audio_file,
+                                title=title,
+                                caption=f"🎵 **{title}**\n📊 Quality: {quality}\n🔗 Source: {url}",
+                                parse_mode=ParseMode.MARKDOWN
+                            )
                     else:
-                        await update.message.reply_video(
-                            video=video_file,
-                            caption=f"🎥 **{title}**\n📊 Quality: {quality}\n🔗 Source: {url}",
-                            parse_mode=ParseMode.MARKDOWN
-                        )
+                        with open(filepath, 'rb') as video_file:
+                            await update.message.reply_video(
+                                video=video_file,
+                                caption=f"🎥 **{title}**\n📊 Quality: {quality}\n🔗 Source: {url}",
+                                parse_mode=ParseMode.MARKDOWN,
+                                supports_streaming=True
+                            )
+                except Exception as upload_error:
+                    logger.error(f"Upload error for {url}: {upload_error}")
+                    await update.message.reply_text(
+                        f"❌ Failed to upload: {title}\n🔗 Direct link: {url}"
+                    )
+                    failed_urls.append((url, f"Upload failed: {str(upload_error)}"))
+                    self.cleanup_temp_files(temp_download_dir)
+                    continue
                 
-                success_count += 1
-                
-                # Cleanup
+                # Cleanup temp files before continuing
                 self.cleanup_temp_files(temp_download_dir)
+                
+                # Small delay between downloads to avoid overwhelming
+                if i < len(urls):
+                    await asyncio.sleep(1)
                 
             except Exception as e:
                 logger.error(f"Error processing {url}: {e}")
                 failed_urls.append((url, str(e)))
+                # Cleanup on error too
+                if 'temp_download_dir' in locals():
+                    self.cleanup_temp_files(temp_download_dir)
                 continue
         
         # Final status
