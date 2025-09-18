@@ -1,183 +1,147 @@
 import os
-import json
+import re
+import logging
+import asyncio
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 import yt_dlp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Environment variables
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+# Whitelist stored in memory
+whitelist = {ADMIN_ID}
+
+# Regex to detect YouTube links (fixed, supports youtu.be and shorts)
+YOUTUBE_REGEX = re.compile(
+    r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/(watch\?v=|shorts/)?[A-Za-z0-9_\-]{11}"
 )
 
-# ----- Environment variables -----
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
+# --- Commands ---
 
-# ----- Whitelist -----
-WHITELIST_FILE = "allowed_users.json"
-if not os.path.exists(WHITELIST_FILE):
-    with open(WHITELIST_FILE, "w") as f:
-        json.dump([ADMIN_ID], f)  # Start with admin only
-
-with open(WHITELIST_FILE, "r") as f:
-    allowed_users = json.load(f)
-
-# ----- Config -----
-BATCH_LIMIT = 5  # Default batch limit
-
-
-# ---------- Helpers ----------
-def save_whitelist():
-    with open(WHITELIST_FILE, "w") as f:
-        json.dump(allowed_users, f)
-
-
-def is_allowed(user_id):
-    return user_id in allowed_users
-
-
-# ---------- Bot Commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not is_allowed(user.id):
-        await update.message.reply_text("🚫 You are not allowed to use this bot.")
+    user_id = update.effective_user.id
+    if user_id not in whitelist:
+        await update.message.reply_text("❌ You are not allowed to use this bot.")
         return
-    await update.message.reply_text(
-        "👋 Welcome! Send me YouTube links (one or multiple separated by spaces/newlines).\n"
-        "Use /quality to pick resolution before downloading.\n"
-        "Default = 480p."
-    )
+    await update.message.reply_text("✅ Send me one or more YouTube links and I’ll download them!")
 
-
-async def set_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Let user pick video quality"""
-    if not is_allowed(update.effective_user.id):
+async def adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
         return
-    keyboard = [
-        [InlineKeyboardButton("240p", callback_data="240"),
-         InlineKeyboardButton("360p", callback_data="360")],
-        [InlineKeyboardButton("480p", callback_data="480"),
-         InlineKeyboardButton("720p", callback_data="720")],
-        [InlineKeyboardButton("1080p", callback_data="1080"),
-         InlineKeyboardButton("🎵 Audio only", callback_data="audio")]
-    ]
-    await update.message.reply_text(
-        "🎥 Choose your preferred quality:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    if not context.args:
+        await update.message.reply_text("Usage: /adduser <user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+        whitelist.add(uid)
+        await update.message.reply_text(f"✅ Added user {uid} to whitelist.")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
 
+async def deluser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /deluser <user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+        whitelist.discard(uid)
+        await update.message.reply_text(f"✅ Removed user {uid} from whitelist.")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
 
-async def quality_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle quality button press"""
-    query = update.callback_query
-    await query.answer()
-    context.user_data["quality"] = query.data
-    await query.edit_message_text(f"✅ Selected quality: {query.data}")
-
-
-async def download_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Download one or more YouTube links"""
-    user = update.effective_user
-    if not is_allowed(user.id):
-        await update.message.reply_text("🚫 You are not allowed to use this bot.")
+async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in whitelist:
+        await update.message.reply_text("❌ You are not allowed to use this bot.")
         return
 
-    links = update.message.text.split()
-    quality = context.user_data.get("quality", "480")  # Default to 480p
+    text = update.message.text.strip()
+    links = YOUTUBE_REGEX.findall(text)
+
+    # Extract proper links
+    matches = re.findall(r"(https?://[^\s]+)", text)
+    links = [url for url in matches if "youtu" in url]
+
+    if not links:
+        await update.message.reply_text("❌ No YouTube links found!\nSend me YouTube links like:\nhttps://youtube.com/watch?v=...")
+        return
+
+    await update.message.reply_text(f"📥 Downloading {len(links)} videos...")
+
     failed = []
-
-    # Limit batch size
-    global BATCH_LIMIT
-    if len(links) > BATCH_LIMIT:
-        await update.message.reply_text(
-            f"⚠️ Too many links! Current limit is {BATCH_LIMIT}. "
-            f"Taking the first {BATCH_LIMIT} only."
-        )
-        links = links[:BATCH_LIMIT]
-
-    for link in links:
+    for idx, url in enumerate(links, start=1):
         try:
+            await update.message.reply_text(f"▶️ Processing video {idx}/{len(links)}...")
+
             ydl_opts = {
-                "outtmpl": "%(title).50s.%(ext)s",  # short filename
+                "format": "best[height<=480]",  # default 480p
+                "outtmpl": f"downloads/%(title)s.%(ext)s",
                 "quiet": True,
-                "format": "bestaudio/best" if quality == "audio" else f"best[height<={quality}]",
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(link, download=True)
-                file_path = ydl.prepare_filename(info)
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
 
-            await update.message.reply_document(document=open(file_path, "rb"))
-            os.remove(file_path)  # Cleanup ✅
+            # Telegram max size 50 MB free, 2 GB premium
+            if os.path.getsize(filename) > 49 * 1024 * 1024:
+                await update.message.reply_text(f"⚠️ Skipped {url} (file too large for free Telegram).")
+                failed.append(url)
+                os.remove(filename)
+                continue
+
+            with open(filename, "rb") as f:
+                await update.message.reply_video(video=f, caption=info.get("title", "Video"))
+
+            os.remove(filename)
+
         except Exception as e:
-            failed.append(link)
-            print(f"❌ Error with {link}: {e}")
+            logger.error(f"Error downloading {url}: {e}")
+            failed.append(url)
 
     if failed:
         await update.message.reply_text("❌ Failed links:\n" + "\n".join(failed))
     else:
-        await update.message.reply_text("✅ All downloads finished!")
+        await update.message.reply_text("✅ All videos sent!")
 
+# --- Main ---
 
-# ---------- Admin Commands ----------
-async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    try:
-        user_id = int(context.args[0])
-        if user_id not in allowed_users:
-            allowed_users.append(user_id)
-            save_whitelist()
-            await update.message.reply_text(f"✅ Added user {user_id}")
-        else:
-            await update.message.reply_text("ℹ️ User already allowed")
-    except:
-        await update.message.reply_text("⚠️ Usage: /adduser <user_id>")
-
-
-async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    try:
-        user_id = int(context.args[0])
-        if user_id in allowed_users:
-            allowed_users.remove(user_id)
-            save_whitelist()
-            await update.message.reply_text(f"❌ Removed user {user_id}")
-        else:
-            await update.message.reply_text("ℹ️ User not in whitelist")
-    except:
-        await update.message.reply_text("⚠️ Usage: /removeuser <user_id>")
-
-
-async def set_batch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command to set batch size"""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    try:
-        global BATCH_LIMIT
-        new_limit = int(context.args[0])
-        BATCH_LIMIT = new_limit
-        await update.message.reply_text(f"✅ Batch limit set to {BATCH_LIMIT}")
-    except:
-        await update.message.reply_text("⚠️ Usage: /setbatch <number>")
-
-
-# ---------- Main ----------
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # Normal user commands
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("quality", set_quality))
-    app.add_handler(CallbackQueryHandler(quality_button))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_videos))
-
-    # Admin commands
-    app.add_handler(CommandHandler("adduser", add_user))
-    app.add_handler(CommandHandler("removeuser", remove_user))
-    app.add_handler(CommandHandler("setbatch", set_batch))
-
-    print("🚀 Bot is running...")
+    app.add_handler(CommandHandler("adduser", adduser))
+    app.add_handler(CommandHandler("deluser", deluser))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_links))
+    logger.info("Bot started")
     app.run_polling()
 
+if __name__ == "__main__":
+    main()
+
+# --- Keep-alive server ---
+from flask import Flask
+import threading
+
+def run_web():
+    app = Flask("keep_alive")
+
+    @app.route("/")
+    def home():
+        return "Bot is alive!"
+
+    app.run(host="0.0.0.0", port=8080)
+
+def keep_alive():
+    t = threading.Thread(target=run_web)
+    t.start()
 
 if __name__ == "__main__":
+    keep_alive()
     main()
